@@ -1,6 +1,8 @@
 package dns
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -77,7 +79,7 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 			fmt.Printf("  [query] %s %s -> %s\n", name, TypeToString(qtype), server)
 		}
 
-		id := uint16(rand.Intn(65536))
+		id := randID()
 		query := NewQuery(id, name, qtype)
 		resp, err := r.Transport.Query(query, server)
 		if err != nil {
@@ -187,6 +189,18 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 }
 
 // removeServer returns a copy of servers with the given server removed.
+// randID returns a cryptographically-random 16-bit DNS transaction ID. The
+// transaction ID is one of the few entropy sources protecting UDP DNS against
+// off-path spoofing, so it must not come from the predictable, default-seeded
+// math/rand generator. Falls back to math/rand only if crypto/rand fails.
+func randID() uint16 {
+	var b [2]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return uint16(rand.Intn(65536))
+	}
+	return binary.BigEndian.Uint16(b[:])
+}
+
 func removeServer(servers []string, server string) []string {
 	var result []string
 	for _, s := range servers {

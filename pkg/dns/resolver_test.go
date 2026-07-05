@@ -4,6 +4,19 @@ import (
 	"testing"
 )
 
+func TestRandIDVaries(t *testing.T) {
+	// crypto/rand-backed IDs must not be a fixed sequence. Collect a batch and
+	// assert we see more than one distinct value (a fixed generator would
+	// produce all-identical or a predictable repeating value here).
+	seen := make(map[uint16]bool)
+	for i := 0; i < 100; i++ {
+		seen[randID()] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("randID produced only %d distinct values across 100 calls; expected variation", len(seen))
+	}
+}
+
 func TestRemoveServer(t *testing.T) {
 	servers := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 
