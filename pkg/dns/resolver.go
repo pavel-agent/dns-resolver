@@ -133,12 +133,14 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 		if len(resp.Authority) > 0 {
 			var newNS []string
 
-			// First, try to find glue records (A records in additional section).
+			// First, try to find glue records (A or AAAA records in the
+			// additional section). net.JoinHostPort handles IPv6 literals, so
+			// AAAA glue is directly usable as a nameserver address.
 			for _, auth := range resp.Authority {
 				if auth.Type == TypeNS {
 					nsName := auth.ParsedData
 					for _, add := range resp.Additional {
-						if add.Type == TypeA && strings.EqualFold(add.Name, nsName) {
+						if (add.Type == TypeA || add.Type == TypeAAAA) && strings.EqualFold(add.Name, nsName) {
 							newNS = append(newNS, add.ParsedData)
 						}
 					}
@@ -154,20 +156,26 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 				continue
 			}
 
-			// No glue records -- need to resolve the NS names.
+			// No glue records -- need to resolve the NS names. Try A first,
+			// then fall back to AAAA so IPv6-only nameservers are usable.
 			for _, auth := range resp.Authority {
 				if auth.Type == TypeNS {
 					nsName := auth.ParsedData
 					if r.Verbose {
 						fmt.Printf("  [resolve ns] %s\n", nsName)
 					}
-					nsRecords, err := r.resolve(nsName, TypeA, depth+1)
-					if err != nil {
-						continue
+					if nsRecords, err := r.resolve(nsName, TypeA, depth+1); err == nil {
+						for _, ns := range nsRecords {
+							if ns.Type == TypeA {
+								newNS = append(newNS, ns.ParsedData)
+							}
+						}
 					}
-					for _, ns := range nsRecords {
-						if ns.Type == TypeA {
-							newNS = append(newNS, ns.ParsedData)
+					if nsRecords, err := r.resolve(nsName, TypeAAAA, depth+1); err == nil {
+						for _, ns := range nsRecords {
+							if ns.Type == TypeAAAA {
+								newNS = append(newNS, ns.ParsedData)
+							}
 						}
 					}
 				}

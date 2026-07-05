@@ -184,6 +184,67 @@ func makeCNAMERecord(name, target string, ttl uint32) ResourceRecord {
 	}
 }
 
+// makeAAAARecord creates a ResourceRecord for an AAAA record.
+func makeAAAARecord(name string, ip net.IP, ttl uint32) ResourceRecord {
+	return ResourceRecord{
+		Name:       name,
+		Type:       TypeAAAA,
+		Class:      ClassIN,
+		TTL:        ttl,
+		RData:      ip.To16(),
+		ParsedData: ip.String(),
+	}
+}
+
+// newMockDNSServerV6 starts a mock DNS server bound to the IPv6 loopback
+// (::1), used to exercise AAAA glue / IPv6 nameserver handling.
+func newMockDNSServerV6(t *testing.T, handler func(req *Message) *Message) *mockDNSServer {
+	t.Helper()
+
+	udpAddr, err := net.ResolveUDPAddr("udp", "[::1]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	port := udpConn.LocalAddr().(*net.UDPAddr).Port
+
+	tcpLn, err := net.Listen("tcp", fmt.Sprintf("[::1]:%d", port))
+	if err != nil {
+		udpConn.Close()
+		t.Skipf("IPv6 loopback TCP unavailable: %v", err)
+	}
+
+	s := &mockDNSServer{udpConn: udpConn, tcpLn: tcpLn, port: port}
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			req, err := Parse(buf[:n])
+			if err != nil {
+				continue
+			}
+			resp := handler(req)
+			if resp == nil {
+				continue
+			}
+			data, err := serializeFullMessage(resp)
+			if err != nil {
+				continue
+			}
+			udpConn.WriteToUDP(data, remoteAddr)
+		}
+	}()
+
+	return s
+}
+
 // newTestResolver creates a resolver that uses the given mock server.
 func newTestResolver(server *mockDNSServer, verbose bool) *Resolver {
 	return &Resolver{
@@ -451,6 +512,79 @@ func TestResolverReferralWithGlue(t *testing.T) {
 	}
 	if result[0].ParsedData != "93.184.216.34" {
 		t.Errorf("got %q, want %q", result[0].ParsedData, "93.184.216.34")
+	}
+}
+
+// TestResolverReferralWithAAAAGlue tests following an NS referral whose glue
+// records are AAAA (IPv6) rather than A.
+func TestResolverReferralWithAAAAGlue(t *testing.T) {
+	var testQueryCount atomic.Int64
+
+	server := newMockDNSServerV6(t, func(req *Message) *Message {
+		if len(req.Questions) == 0 {
+			return nil
+		}
+		q := req.Questions[0]
+		name := strings.ToLower(q.Name)
+
+		if name == "test.example.com" && q.Type == TypeA {
+			count := testQueryCount.Add(1)
+			if count == 1 {
+				// First query: referral with AAAA glue only.
+				return &Message{
+					Header: Header{
+						ID:      req.Header.ID,
+						Flags:   FlagQR,
+						QDCount: 1,
+						NSCount: 1,
+						ARCount: 1,
+					},
+					Questions: []Question{q},
+					Authority: []ResourceRecord{
+						makeNSRecord("example.com", "ns1.example.com", 3600),
+					},
+					Additional: []ResourceRecord{
+						makeAAAARecord("ns1.example.com", net.IPv6loopback, 3600),
+					},
+				}
+			}
+			// Second query (after following AAAA glue): return the answer.
+			return &Message{
+				Header: Header{
+					ID:      req.Header.ID,
+					Flags:   FlagQR,
+					QDCount: 1,
+					ANCount: 1,
+				},
+				Questions: []Question{q},
+				Answers: []ResourceRecord{
+					makeARecord(q.Name, net.IPv4(93, 184, 216, 34), 300),
+				},
+			}
+		}
+
+		return nil
+	})
+	defer server.close()
+
+	origRootServers := rootServers
+	rootServers = []string{"::1"}
+	defer func() { rootServers = origRootServers }()
+
+	r := newTestResolver(server, true)
+
+	result, err := r.Resolve("test.example.com", TypeA)
+	if err != nil {
+		t.Fatalf("Resolve with AAAA glue referral failed: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("expected at least 1 result")
+	}
+	if result[0].ParsedData != "93.184.216.34" {
+		t.Errorf("got %q, want %q", result[0].ParsedData, "93.184.216.34")
+	}
+	if testQueryCount.Load() < 2 {
+		t.Errorf("expected the AAAA glue to be followed (>=2 queries), got %d", testQueryCount.Load())
 	}
 }
 
