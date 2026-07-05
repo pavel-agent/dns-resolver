@@ -16,7 +16,12 @@ const (
 	TypeMX    uint16 = 15
 	TypeTXT   uint16 = 16
 	TypeAAAA  uint16 = 28
+	TypeOPT   uint16 = 41 // EDNS0 OPT pseudo-record (RFC 6891)
 )
+
+// defaultUDPSize is the EDNS0 UDP payload size we advertise. 1232 bytes is the
+// widely-recommended value that avoids IP fragmentation on most paths.
+const defaultUDPSize uint16 = 1232
 
 // DNS classes.
 const (
@@ -115,6 +120,8 @@ func TypeToString(t uint16) string {
 		return "TXT"
 	case TypeAAAA:
 		return "AAAA"
+	case TypeOPT:
+		return "OPT"
 	default:
 		return fmt.Sprintf("TYPE%d", t)
 	}
@@ -140,13 +147,17 @@ func StringToType(s string) (uint16, error) {
 	}
 }
 
-// NewQuery creates a new DNS query message.
+// NewQuery creates a new DNS query message. It includes an EDNS0 OPT
+// pseudo-record in the additional section advertising a larger UDP payload
+// size (defaultUDPSize), so servers may return larger UDP responses instead of
+// truncating and forcing a TCP round-trip (RFC 6891).
 func NewQuery(id uint16, name string, qtype uint16) *Message {
 	return &Message{
 		Header: Header{
 			ID:      id,
 			Flags:   0, // Standard query, no recursion desired (we do it ourselves)
 			QDCount: 1,
+			ARCount: 1,
 		},
 		Questions: []Question{
 			{
@@ -155,6 +166,21 @@ func NewQuery(id uint16, name string, qtype uint16) *Message {
 				Class: ClassIN,
 			},
 		},
+		Additional: []ResourceRecord{newOPTRecord(defaultUDPSize)},
+	}
+}
+
+// newOPTRecord builds an EDNS0 OPT pseudo-record. Per RFC 6891 the OPT record
+// has an empty root name, TYPE=41, and the CLASS field carries the requestor's
+// UDP payload size. TTL carries extended rcode/flags (0 here) and there is no
+// rdata.
+func newOPTRecord(udpSize uint16) ResourceRecord {
+	return ResourceRecord{
+		Name:  "",
+		Type:  TypeOPT,
+		Class: udpSize,
+		TTL:   0,
+		RData: nil,
 	}
 }
 
@@ -176,6 +202,18 @@ func (m *Message) Serialize() ([]byte, error) {
 		binary.BigEndian.PutUint16(b[0:2], q.Type)
 		binary.BigEndian.PutUint16(b[2:4], q.Class)
 		buf = append(buf, b...)
+	}
+
+	// Emit additional-section records (e.g. the EDNS0 OPT pseudo-record).
+	for _, rr := range m.Additional {
+		buf = append(buf, encodeName(rr.Name)...)
+		meta := make([]byte, 10)
+		binary.BigEndian.PutUint16(meta[0:2], rr.Type)
+		binary.BigEndian.PutUint16(meta[2:4], rr.Class)
+		binary.BigEndian.PutUint32(meta[4:8], rr.TTL)
+		binary.BigEndian.PutUint16(meta[8:10], uint16(len(rr.RData)))
+		buf = append(buf, meta...)
+		buf = append(buf, rr.RData...)
 	}
 
 	return buf, nil

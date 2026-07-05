@@ -217,6 +217,53 @@ func TestSerializeMultipleQuestionTypes(t *testing.T) {
 	}
 }
 
+func TestNewQueryIncludesOPTRecord(t *testing.T) {
+	msg := NewQuery(0x1234, "example.com", TypeA)
+
+	if msg.Header.ARCount != 1 {
+		t.Fatalf("ARCount = %d, want 1 (EDNS0 OPT record)", msg.Header.ARCount)
+	}
+	if len(msg.Additional) != 1 {
+		t.Fatalf("len(Additional) = %d, want 1", len(msg.Additional))
+	}
+	opt := msg.Additional[0]
+	if opt.Type != TypeOPT {
+		t.Errorf("OPT Type = %d, want %d", opt.Type, TypeOPT)
+	}
+	if opt.Class != defaultUDPSize {
+		t.Errorf("OPT advertised UDP size = %d, want %d", opt.Class, defaultUDPSize)
+	}
+}
+
+func TestSerializeQueryContainsOPT(t *testing.T) {
+	msg := NewQuery(0xABCD, "example.com", TypeA)
+	data, err := msg.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize failed: %v", err)
+	}
+
+	parsed, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if parsed.Header.ARCount != 1 {
+		t.Fatalf("parsed ARCount = %d, want 1", parsed.Header.ARCount)
+	}
+	if len(parsed.Additional) != 1 {
+		t.Fatalf("parsed Additional count = %d, want 1", len(parsed.Additional))
+	}
+	opt := parsed.Additional[0]
+	if opt.Type != TypeOPT {
+		t.Errorf("parsed OPT Type = %d, want %d", opt.Type, TypeOPT)
+	}
+	if opt.Class != defaultUDPSize {
+		t.Errorf("parsed OPT advertised UDP size = %d, want %d", opt.Class, defaultUDPSize)
+	}
+	if opt.Name != "" {
+		t.Errorf("OPT name = %q, want root (empty)", opt.Name)
+	}
+}
+
 func TestParseTooShort(t *testing.T) {
 	_, err := Parse([]byte{0, 1, 2})
 	if err == nil {

@@ -105,6 +105,15 @@ func startMockDNSServers(t *testing.T, handler func([]byte) []byte) (int, func()
 	}
 }
 
+// parseFirstQuestion extracts the first question from a raw query, falling back
+// to a default example.com/A question if parsing fails.
+func parseFirstQuestion(queryData []byte) Question {
+	if msg, err := Parse(queryData); err == nil && len(msg.Questions) > 0 {
+		return msg.Questions[0]
+	}
+	return Question{Name: "example.com", Type: TypeA, Class: ClassIN}
+}
+
 // buildResponseFromQuery builds a DNS response for a query with an A record answer.
 func buildResponseFromQuery(queryData []byte, ip net.IP, flags uint16) []byte {
 	if len(queryData) < 12 {
@@ -120,8 +129,16 @@ func buildResponseFromQuery(queryData []byte, ip net.IP, flags uint16) []byte {
 	binary.BigEndian.PutUint16(header[6:8], 1) // ANCount
 	buf = append(buf, header...)
 
-	// Copy question section from query.
-	buf = append(buf, queryData[12:]...)
+	// Echo the question section from the query. We re-encode just the
+	// question (rather than copying the raw tail) so that any additional-
+	// section records in the query (e.g. an EDNS0 OPT record) are not
+	// mistaken for the answer.
+	q := parseFirstQuestion(queryData)
+	buf = append(buf, encodeName(q.Name)...)
+	qf := make([]byte, 4)
+	binary.BigEndian.PutUint16(qf[0:2], q.Type)
+	binary.BigEndian.PutUint16(qf[2:4], q.Class)
+	buf = append(buf, qf...)
 
 	// Answer: A record.
 	buf = append(buf, encodeName("example.com")...)

@@ -9,7 +9,12 @@ import (
 
 const (
 	defaultTimeout = 5 * time.Second
-	maxUDPSize     = 512
+	// maxUDPSize is the legacy non-EDNS0 UDP message limit (RFC 1035).
+	maxUDPSize = 512
+	// udpReadBufferSize matches the EDNS0 UDP payload size we advertise in
+	// queries, so larger (non-truncated) EDNS0 responses are read fully
+	// instead of being silently clipped by a 512-byte buffer.
+	udpReadBufferSize = int(defaultUDPSize)
 )
 
 // Transport handles sending DNS queries and receiving responses over UDP and TCP.
@@ -74,7 +79,7 @@ func (t *Transport) queryUDP(msg *Message, server string) (*Message, error) {
 		return nil, fmt.Errorf("sending query: %w", err)
 	}
 
-	buf := make([]byte, maxUDPSize)
+	buf := make([]byte, udpReadBufferSize)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
