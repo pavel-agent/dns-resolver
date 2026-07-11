@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"time"
 )
 
 // Root DNS servers (IPv4 addresses).
@@ -32,10 +33,14 @@ type Resolver struct {
 	Verbose   bool
 }
 
-// NewResolver creates a new Resolver with a cache and transport.
+// NewResolver creates a new Resolver with a cache and transport. It also
+// starts a background goroutine that periodically purges expired cache entries
+// so memory stays bounded in long-running processes.
 func NewResolver(verbose bool) *Resolver {
+	cache := NewCache()
+	cache.StartPurgeLoop(time.Minute, nil)
 	return &Resolver{
-		Cache:     NewCache(),
+		Cache:     cache,
 		Transport: NewTransport(),
 		Verbose:   verbose,
 	}
@@ -62,8 +67,16 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 		return cached, nil
 	}
 
-	// Start from root servers.
+	// Start from the deepest cached delegation for this name if one exists,
+	// otherwise from the root servers. This avoids re-walking root -> TLD ->
+	// authoritative on every query in the same zone.
 	nameservers := rootServers
+	if cachedNS, zone := r.Cache.GetDelegation(name); len(cachedNS) > 0 {
+		nameservers = cachedNS
+		if r.Verbose {
+			fmt.Printf("[delegation hit] %s -> zone %s (%d nameservers)\n", name, zone, len(cachedNS))
+		}
+	}
 
 	if r.Verbose {
 		fmt.Printf("[resolve] %s %s (depth=%d)\n", name, TypeToString(qtype), depth)
@@ -132,11 +145,17 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 		// No answers -- look for referrals in authority section.
 		if len(resp.Authority) > 0 {
 			var newNS []string
+			var zone string
+			var zoneTTL uint32
 
 			// First, try to find glue records (A records in additional section).
 			for _, auth := range resp.Authority {
 				if auth.Type == TypeNS {
 					nsName := auth.ParsedData
+					if zone == "" {
+						zone = auth.Name
+						zoneTTL = auth.TTL
+					}
 					for _, add := range resp.Additional {
 						if add.Type == TypeA && strings.EqualFold(add.Name, nsName) {
 							newNS = append(newNS, add.ParsedData)
@@ -145,10 +164,14 @@ func (r *Resolver) resolve(name string, qtype uint16, depth int) ([]ResourceReco
 				}
 			}
 
-			// If we found glue records, use them.
+			// If we found glue records, use them and cache the delegation so
+			// later queries in the same zone can skip the root/TLD walk.
 			if len(newNS) > 0 {
 				if r.Verbose {
 					fmt.Printf("  [referral] following %d nameservers\n", len(newNS))
+				}
+				if zone != "" {
+					r.Cache.PutDelegation(zone, newNS, zoneTTL)
 				}
 				nameservers = newNS
 				continue

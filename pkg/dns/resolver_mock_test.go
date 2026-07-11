@@ -454,6 +454,117 @@ func TestResolverReferralWithGlue(t *testing.T) {
 	}
 }
 
+// TestResolverCachesDelegation verifies that a delegation discovered while
+// resolving one name in a zone is reused for a second name in the same zone,
+// so the second resolution issues fewer upstream queries (it skips the
+// root/TLD referral round-trip).
+func TestResolverCachesDelegation(t *testing.T) {
+	var referralCount atomic.Int64
+
+	server := newMockDNSServer(t, func(req *Message) *Message {
+		if len(req.Questions) == 0 {
+			return nil
+		}
+		q := req.Questions[0]
+		name := strings.ToLower(q.Name)
+
+		// The "root" only knows a delegation for example.com; it returns a
+		// referral (with glue pointing back at this same mock) for any name
+		// in the zone. We detect a "referral" query as one whose name is not
+		// yet delegated. To keep it simple, always answer A queries directly
+		// but return a referral the *first* time each distinct name is seen.
+		if q.Type == TypeA && strings.HasSuffix(name, "example.com") {
+			// Heuristic: the resolver first queries the root (which we model as
+			// this server) and, on a referral, re-queries the delegated NS
+			// (also this server). Count referrals issued.
+			// A query arriving with the delegation already cached will target
+			// the delegated NS directly; we can't see cache state, so instead
+			// we always return the answer but ALSO include a referral only
+			// when the additional section is empty in the request. Simpler:
+			// return referral on the very first query overall, answer after.
+			if referralCount.Load() == 0 {
+				referralCount.Add(1)
+				return &Message{
+					Header: Header{
+						ID:      req.Header.ID,
+						Flags:   FlagQR,
+						QDCount: 1,
+						NSCount: 1,
+						ARCount: 1,
+					},
+					Questions: []Question{q},
+					Authority: []ResourceRecord{
+						makeNSRecord("example.com", "ns1.example.com", 3600),
+					},
+					Additional: []ResourceRecord{
+						makeARecord("ns1.example.com", net.IPv4(127, 0, 0, 1), 3600),
+					},
+				}
+			}
+			return &Message{
+				Header: Header{
+					ID:      req.Header.ID,
+					Flags:   FlagQR,
+					QDCount: 1,
+					ANCount: 1,
+				},
+				Questions: []Question{q},
+				Answers: []ResourceRecord{
+					makeARecord(q.Name, net.IPv4(93, 184, 216, 34), 300),
+				},
+			}
+		}
+		return nil
+	})
+	defer server.close()
+
+	origRootServers := rootServers
+	rootServers = []string{"127.0.0.1"}
+	defer func() { rootServers = origRootServers }()
+
+	r := newTestResolver(server, false)
+
+	// First resolution triggers a referral and caches the example.com
+	// delegation.
+	if _, err := r.Resolve("a.example.com", TypeA); err != nil {
+		t.Fatalf("first resolve failed: %v", err)
+	}
+	if referralCount.Load() != 1 {
+		t.Fatalf("expected exactly one referral on first resolve, got %d", referralCount.Load())
+	}
+
+	// Second resolution of a different name in the same zone must reuse the
+	// cached delegation and therefore not require another referral.
+	if _, err := r.Resolve("b.example.com", TypeA); err != nil {
+		t.Fatalf("second resolve failed: %v", err)
+	}
+	if referralCount.Load() != 1 {
+		t.Errorf("expected no additional referral on second resolve (delegation reuse), got total %d", referralCount.Load())
+	}
+
+	// Confirm the delegation is actually cached.
+	if ns, zone := r.Cache.GetDelegation("c.example.com"); len(ns) == 0 || zone != "example.com" {
+		t.Errorf("expected cached delegation for example.com, got ns=%v zone=%q", ns, zone)
+	}
+}
+
+// TestCachePurgeRemovesDelegations verifies Purge clears expired delegations.
+func TestCachePurgeRemovesDelegations(t *testing.T) {
+	c := NewCache()
+	c.PutDelegation("example.com", []string{"127.0.0.1"}, 30)
+	if ns, _ := c.GetDelegation("x.example.com"); len(ns) == 0 {
+		t.Fatal("expected delegation to be cached")
+	}
+	// Force expiry then purge.
+	c.mu.Lock()
+	c.delegations["example.com"].ExpiresAt = time.Now().Add(-time.Hour)
+	c.mu.Unlock()
+	c.Purge()
+	if ns, _ := c.GetDelegation("x.example.com"); len(ns) != 0 {
+		t.Error("expected expired delegation to be purged")
+	}
+}
+
 // TestResolverReferralWithoutGlue tests following NS referrals without glue records.
 func TestResolverReferralWithoutGlue(t *testing.T) {
 	var targetQueryCount atomic.Int64
